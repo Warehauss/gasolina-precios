@@ -1,0 +1,52 @@
+# Cada día descarga los precios oficiales de gasolina (CNE) y los publica en
+# GitHub Pages para la app "Gasolina". También se puede correr a mano desde la
+# pestaña Actions › "Actualizar precios" › "Run workflow".
+name: Actualizar precios
+
+on:
+  schedule:
+    - cron: '0 13 * * *' # 7:00 a. m. en la Ciudad de México
+  workflow_dispatch:
+
+permissions:
+  contents: write # para guardar la fecha de la última actualización
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.publicar.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Descargar y procesar precios
+        run: node actualizar.mjs
+
+      # GitHub apaga las tareas programadas de un repositorio sin actividad en
+      # 60 días; guardar la fecha cada día cuenta como actividad.
+      - name: Guardar fecha de la última actualización
+        run: |
+          node -e "console.log(require('./salida/indice.json').fecha)" > ultima-actualizacion.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
+          git add ultima-actualizacion.txt
+          git diff --cached --quiet || git commit -m "Precios del $(cat ultima-actualizacion.txt)"
+          git push
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: salida
+
+      - id: publicar
+        uses: actions/deploy-pages@v4
