@@ -7,16 +7,65 @@
 //
 // Salida (carpeta "salida"):
 //   indice.json          { fecha, estaciones, zonas: ["19_-100", ...] }
-//   zonas/19_-100.json   { fecha, e: [[nombre, lat, lon, magna, premium, diesel], ...] }
+//   zonas/19_-100.json   { fecha, e: [[nombre, lat, lon, magna, premium, diesel, marca], ...] }
 // Cada zona es un cuadro de 1° × 1° (unos 110 km) identificado por la latitud y
 // longitud redondeadas hacia abajo.
+//
+// La CNE no dice la marca (Pemex, Shell, BP…). Se toma de OpenStreetMap
+// (© colaboradores de OpenStreetMap, licencia ODbL) buscando la gasolinera que
+// está en el mismo lugar. No todas la tienen; entonces la marca va en null.
 
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 const URL_LUGARES = 'https://publicacionexterna.azurewebsites.net/publicaciones/places';
 const URL_PRECIOS = 'https://publicacionexterna.azurewebsites.net/publicaciones/prices';
+const SERVIDORES_OSM = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+];
+const CONSULTA_OSM =
+  '[out:json][timeout:240];area["ISO3166-1"="MX"][admin_level=2]->.mx;nwr["amenity"="fuel"]["brand"](area.mx);out center tags;';
+const DISTANCIA_MAXIMA_M = 80; // a más de esto no se considera la misma gasolinera
 const SALIDA = 'salida';
+
+// Mismas marcas escritas de distintas formas en OpenStreetMap.
+const MARCAS = {
+  pemex: 'Pemex',
+  oxxo: 'Oxxo Gas',
+  'oxxo gas': 'Oxxo Gas',
+  bp: 'BP',
+  'british petroleum': 'BP',
+  'gasolinera g500': 'G500',
+  hidrosima: 'Hidrosina',
+  mobil: 'Mobil',
+  g500: 'G500',
+  shell: 'Shell',
+  chevron: 'Chevron',
+  arco: 'Arco',
+  total: 'TotalEnergies',
+  totalenergies: 'TotalEnergies',
+  'petro seven': 'Petro-7',
+  'petro 7': 'Petro-7',
+  'petro-7': 'Petro-7',
+  'la gas': 'La Gas',
+  lagas: 'La Gas',
+  gulf: 'Gulf',
+  repsol: 'Repsol',
+  valero: 'Valero',
+  hidrosina: 'Hidrosina',
+  rendichicas: 'Rendichicas',
+  akron: 'Akron',
+};
+
+function nombreMarca(texto) {
+  const limpio = texto.trim();
+  const conocida = MARCAS[limpio.toLowerCase()];
+  if (conocida) return conocida;
+  // Otras marcas se dejan como vienen, salvo cosas que no parecen marca.
+  return /[a-z]{2,}/i.test(limpio) && limpio.length <= 25 ? limpio : null;
+}
 
 async function descargar(url) {
   for (let intento = 1; intento <= 3; intento++) {
@@ -65,11 +114,78 @@ function leerPrecios(xml) {
   return precios;
 }
 
+/**
+ * Gasolineras de México con marca en OpenStreetMap, en una rejilla de ~1 km
+ * para buscar rápido. Si OpenStreetMap no responde, se publica sin marcas.
+ */
+async function leerMarcasOsm() {
+  for (const servidor of SERVIDORES_OSM) {
+    try {
+      const r = await fetch(servidor, {
+        method: 'POST',
+        headers: { 'User-Agent': 'gasolina-precios (github.com/warehauss/gasolina-precios)' },
+        body: new URLSearchParams({ data: CONSULTA_OSM }),
+        signal: AbortSignal.timeout(300_000),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const { elements } = await r.json();
+      const rejilla = new Map();
+      for (const e of elements) {
+        const lat = e.lat ?? e.center?.lat;
+        const lon = e.lon ?? e.center?.lon;
+        const marca = nombreMarca(e.tags?.brand ?? '');
+        if (lat === undefined || lon === undefined || !marca) continue;
+        const clave = celda(lat, lon);
+        if (!rejilla.has(clave)) rejilla.set(clave, []);
+        rejilla.get(clave).push({ lat, lon, marca });
+      }
+      console.log(`OpenStreetMap: ${elements.length} gasolineras con marca (${servidor})`);
+      return rejilla;
+    } catch (e) {
+      console.warn(`OpenStreetMap no respondió en ${servidor}: ${e.message}`);
+    }
+  }
+  console.warn('Se publica sin marcas.');
+  return new Map();
+}
+
+const celda = (lat, lon) => `${Math.floor(lat * 100)}_${Math.floor(lon * 100)}`;
+
+function metros(a, b) {
+  const dy = (a.lat - b.lat) * 111_320;
+  const dx = (a.lon - b.lon) * 111_320 * Math.cos((a.lat * Math.PI) / 180);
+  return Math.hypot(dx, dy);
+}
+
+/** Marca de la gasolinera de OpenStreetMap más cercana (a menos de 80 m), o null. */
+function buscarMarca(rejilla, lugar) {
+  const la = Math.floor(lugar.lat * 100);
+  const lo = Math.floor(lugar.lon * 100);
+  let mejor = null;
+  let distancia = DISTANCIA_MAXIMA_M;
+  for (let i = -1; i <= 1; i++) {
+    for (let j = -1; j <= 1; j++) {
+      for (const e of rejilla.get(`${la + i}_${lo + j}`) ?? []) {
+        const d = metros(lugar, e);
+        if (d < distancia) {
+          distancia = d;
+          mejor = e.marca;
+        }
+      }
+    }
+  }
+  return mejor;
+}
+
 const redondear = (n, d) => Math.round(n * 10 ** d) / 10 ** d;
 
 async function main() {
   console.log('Descargando lugares y precios de la CNE…');
-  const [xmlLugares, xmlPrecios] = await Promise.all([descargar(URL_LUGARES), descargar(URL_PRECIOS)]);
+  const [xmlLugares, xmlPrecios, marcas] = await Promise.all([
+    descargar(URL_LUGARES),
+    descargar(URL_PRECIOS),
+    leerMarcasOsm(),
+  ]);
   const lugares = leerLugares(xmlLugares);
   const precios = leerPrecios(xmlPrecios);
   console.log(`Lugares: ${lugares.size} · con precio: ${precios.size}`);
@@ -81,11 +197,13 @@ async function main() {
   const fecha = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' });
   const zonas = new Map();
   let estaciones = 0;
+  let conMarca = 0;
   for (const [id, lugar] of lugares) {
     const p = precios.get(id);
     if (!p) continue;
     const clave = `${Math.floor(lugar.lat)}_${Math.floor(lugar.lon)}`;
     if (!zonas.has(clave)) zonas.set(clave, []);
+    const marca = buscarMarca(marcas, lugar);
     zonas.get(clave).push([
       lugar.nombre,
       redondear(lugar.lat, 5),
@@ -93,9 +211,12 @@ async function main() {
       p.regular ?? null,
       p.premium ?? null,
       p.diesel ?? null,
+      marca,
     ]);
     estaciones++;
+    if (marca) conMarca++;
   }
+  console.log(`Con marca: ${conMarca} de ${estaciones}.`);
 
   await rm(SALIDA, { recursive: true, force: true });
   await mkdir(join(SALIDA, 'zonas'), { recursive: true });
